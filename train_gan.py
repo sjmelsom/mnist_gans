@@ -5,13 +5,10 @@ import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
 from torch import optim
+from skimage.io import imsave
 import torch.nn.functional as F
 from torchvision import datasets
 from torchvision import transforms
-from skimage.io import imsave
-import matplotlib.pyplot as plt
-from torchvision.utils import make_grid
-from torchvision.utils import save_image
 from skimage.exposure import rescale_intensity
 
 
@@ -46,24 +43,37 @@ class G(nn.Module):
 
 class MNISTGAN:
     def __init__(self, experiment):
+        # Hyperparams
         self.batch_size = 128
-        self.lr = 2e-4
         self.epochs = 100
         self.z_dim = 100
+        self.lr = 2e-4
+
+        # Data augmentations
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=(0.5,), std=(0.5,))
         ])
+
+        # Instantiate data loaders
         self.train_dataset = datasets.MNIST(root='/data', train=True, download=True, transform=transform)
         self.train_loader = torch.utils.data.DataLoader(dataset=self.train_dataset, batch_size=self.batch_size, shuffle=True)
         self.mnist_dim = self.train_dataset.train_data.size(1) * self.train_dataset.train_data.size(2)
+
+        # Setup discriminator
         self.d = D(self.mnist_dim)
         self.d.cuda()
+
+        # Setup generator
         self.g = G(self.z_dim, self.mnist_dim)
         self.g.cuda()
+
+        # Setup loss and optimizers
         self.loss = nn.BCELoss()
         self.g_opt = optim.Adam(self.g.parameters(), lr=self.lr)
         self.d_opt = optim.Adam(self.d.parameters(), lr=self.lr)
+
+        # Setup logging
         self.experiment = experiment
         exp_dir = os.path.join('experiments', experiment)
         self.images_dir = os.path.join(exp_dir, 'images')
@@ -74,24 +84,34 @@ class MNISTGAN:
         self.d.zero_grad()
 
         x_real = x.view(-1, self.mnist_dim)
-        y_real = torch.FloatTensor(x.shape[0], 1).uniform_(0, 0.1)
         x_real = x_real.cuda()
-        y_real = y_real.cuda()
+        soft_labels = torch.FloatTensor(x.shape[0], 1).uniform_(0, 0.1)
+        soft_labels = soft_labels.cuda()
 
+        # Pass real examples through discriminator
         d_output = self.d(x_real)
-        real_loss = self.loss(d_output, y_real)
+
+        # Compute discriminator loss for real examples
+        real_loss = self.loss(d_output, soft_labels)
         
+        # Create latent noise vectors
         z = torch.FloatTensor(self.batch_size, self.z_dim).normal_()
         z = z.cuda()
-        x_fake = self.g(z)
-        y_fake = torch.FloatTensor(self.batch_size, 1).uniform_(0.9, 1)
-        x_fake = x_fake.cuda()
-        y_fake = y_fake.cuda()
 
-        g_output = self.d(x_fake)
-        fake_loss = self.loss(g_output, y_fake)
+        # Generate generated examples
+        generated_images = self.g(z)
+        generated_images = generated_images.cuda()
 
-        d_loss = real_loss + fake_loss
+        # Create labels for generated examples
+        soft_labels = torch.FloatTensor(self.batch_size, 1).uniform_(0.9, 1)
+        soft_labels = soft_labels.cuda()
+
+        # Pass generated examples through discriminator
+        generated_images = self.d(generated_images)
+        generated_loss = self.loss(generated_images, soft_labels)
+
+        # Add loss of real and generated examples to create the total loss
+        d_loss = real_loss + generated_loss
         d_loss.backward()
         self.d_opt.step()
 
@@ -100,37 +120,56 @@ class MNISTGAN:
     def train_g(self, x):
         self.g.zero_grad()
 
+        # Create labels
+        soft_labels = torch.FloatTensor(self.batch_size, 1).uniform_(0, 0.1)
+        soft_labels = soft_labels.cuda()
+
+        # Create latent noise vectors
         z = torch.FloatTensor(self.batch_size, self.z_dim).normal_()
-        # z = torch.randn(self.batch_size, self.z_dim)
         z = z.cuda()
-        y = torch.FloatTensor(self.batch_size, 1).uniform_(0, 0.1)
-        y = y.cuda()
 
-        g_output = self.g(z)
-        d_output = self.d(g_output)
-        g_loss = self.loss(d_output, y)
+        # Pass noise through generator to create generated images
+        generated_images = self.g(z)
 
+        # Pass generated images through discriminator
+        d_output = self.d(generated_images)
+
+        # Compute how good the generated images look by how well they were able
+        # to fool the discriminator.
+        g_loss = self.loss(d_output, soft_labels)
+
+        # Step optimizer
         g_loss.backward()
         self.g_opt.step()
 
-        return g_output[:10], g_loss.data.item()
+        return generated_images[:10], g_loss.data.item()
 
 
     def train(self):
         t1 = tqdm(range(self.epochs), position=0)
+
+        # For each epoch
         for epoch in t1:
+
+            # For each batch
             for batch_index, (x, _) in tqdm(enumerate(self.train_loader), position=1, total=len(self.train_loader)):
                 d_loss = self.train_d(x)
-                g_output, g_loss = self.train_g(x)
-            self.log_images(g_output, epoch)
+
+                # Get generated images and their corresponding labels
+                generated_images, g_loss = self.train_g(x)
+
+            # Save some example images
+            self.log_images(generated_images, epoch)
+            
+            # Update progress bar
             t1.set_description(f'D: {d_loss:.2f} | G: {g_loss:.2f}')
 
 
-    def log_images(self, g_output, epoch):
+    def log_images(self, generated_images, epoch):
         im_name = os.path.join(self.images_dir, f'epoch{epoch}.jpg')
-        imgs = g_output.view(-1, 28, 28)
+        imgs = generated_images.view(-1, 28, 28)
         imgs = [img.cpu().detach().numpy() for img in imgs]
-        imgs = [rescale_intensity(img, out_range=(0, 255)).astype(np.uint8) for img in imgs]
+        imgs = [rescale_intensity(img, out_range=(0, 255)).astype(np.uint16) for img in imgs]
         imgs = np.hstack(imgs)
         imsave(im_name, imgs)
 

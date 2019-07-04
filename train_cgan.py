@@ -1,17 +1,16 @@
 import os
-import torch
 import argparse
+
+import torch
 import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
 from torch import optim
+from skimage.io import imsave
+import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from torchvision import datasets
 from torchvision import transforms
-from skimage.io import imsave
-import matplotlib.pyplot as plt
-from torchvision.utils import make_grid
-from torchvision.utils import save_image
 from skimage.exposure import rescale_intensity
 
 
@@ -57,24 +56,39 @@ class G(nn.Module):
 
 class MNISTGAN:
     def __init__(self, experiment):
+        # Hyperparams
         self.batch_size = 128
-        self.lr = 1e-4
         self.epochs = 100
         self.z_dim = 100
+        self.lr = 1e-4
+
+        # Data augmentations
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=(0.5,), std=(0.5,))
         ])
+
+        # Instantiate data loader
         self.train_dataset = datasets.MNIST(root='/data', train=True, download=True, transform=transform)
         self.train_loader = torch.utils.data.DataLoader(dataset=self.train_dataset, batch_size=self.batch_size, shuffle=True)
+
+        num_digits = 10
         self.mnist_dim = self.train_dataset.train_data.size(1) * self.train_dataset.train_data.size(2)
-        self.d = D(self.mnist_dim+10, 1)
+
+        # Setup discriminator
+        self.d = D(self.mnist_dim+num_digits, 1)
         self.d.cuda()
-        self.g = G(self.z_dim+10, self.mnist_dim)
+
+        # Setup generator
+        self.g = G(self.z_dim+num_digits, self.mnist_dim)
         self.g.cuda()
+
+        # Setup loss and optimizers
         self.loss = nn.BCELoss()
         self.g_opt = optim.Adam(self.g.parameters(), lr=self.lr)
         self.d_opt = optim.Adam(self.d.parameters(), lr=self.lr)
+
+        # Setup logging
         self.experiment = experiment
         exp_dir = os.path.join('experiments', experiment)
         self.images_dir = os.path.join(exp_dir, 'images')
@@ -87,24 +101,35 @@ class MNISTGAN:
         x = x.cuda()
         labels = labels.long().cuda()
 
-        output = self.d(x, labels)
-        y_real = torch.FloatTensor(x.shape[0], 1).uniform_(0, 0.1)
-        y_real = y_real.cuda()
-        real_loss = self.loss(output, y_real)
+        # Pass real examples through discriminator
+        d_output = self.d(x, labels)
+        soft_labels = torch.FloatTensor(x.shape[0], 1).uniform_(0, 0.1)
+        soft_labels = soft_labels.cuda()
+        real_loss = self.loss(d_output, soft_labels)
         
+        # Create latent noise vectors
         z = torch.FloatTensor(self.batch_size, self.z_dim).normal_()
         z = z.cuda()
-        fake_labels = torch.FloatTensor(self.batch_size, 1).random_(0, 10)
-        fake_labels = fake_labels.long().cuda()
-        fake_images = self.g(z, fake_labels)
 
-        output = self.d(fake_images, fake_labels)
-        y_fake = torch.FloatTensor(self.batch_size, 1).uniform_(0.9, 1)
-        y_fake = y_fake.cuda()
-        fake_loss = self.loss(output, y_fake)
+        # Create labels
+        labels = torch.FloatTensor(self.batch_size, 1).random_(0, 10)
+        labels = labels.long().cuda()
 
-        d_loss = real_loss + fake_loss
-        d_loss.cuda()
+        # Generate images
+        generated_images = self.g(z, labels)
+
+        # Pass generated examples through discriminator
+        d_output = self.d(generated_images, labels)
+
+        # Create labels for generated examples
+        soft_labels = torch.FloatTensor(self.batch_size, 1).uniform_(0.9, 1)
+        soft_labels = soft_labels.cuda()
+
+        # Compute loss for generated examples
+        generated_loss = self.loss(d_output, soft_labels)
+
+        # Add loss of real and generated examples to create the total loss
+        d_loss = real_loss + generated_loss
         d_loss.backward()
         self.d_opt.step()
 
@@ -113,33 +138,56 @@ class MNISTGAN:
     def train_g(self, x):
         self.g.zero_grad()
 
-        fake_labels = torch.FloatTensor(self.batch_size, 1).random_(0, 10)
-        fake_labels = fake_labels.long().cuda()
-        z = torch.FloatTensor(fake_labels.shape[0], self.z_dim).normal_()
+        # Create random labels
+        labels = torch.FloatTensor(self.batch_size, 1).random_(0, 10)
+        labels = labels.long().cuda()
+
+        # Create latent noise vectors
+        z = torch.FloatTensor(labels.shape[0], self.z_dim).normal_()
         z = z.cuda()
 
-        fake_images = self.g(z, fake_labels)
-        d_output = self.d(fake_images, fake_labels)
-        # g_loss = self.loss(d_output, torch.FloatTensor(fake_labels.shape[0], 1).uniform_(0, 0.1))
-        soft_fake_labels = torch.FloatTensor(fake_labels.shape[0], 1).uniform_(0, 0.1)
-        soft_fake_labels = soft_fake_labels.cuda()
-        g_loss = self.loss(d_output, soft_fake_labels)
+        # Pass noise and labels through generator to create generated images
+        generated_images = self.g(z, labels)
+
+        # Pass generated images through discriminator
+        d_output = self.d(generated_images, labels)
+
+        # Create soft labels (near 0 or 1 instead of exactly 0 or 1)
+        soft_labels = torch.FloatTensor(labels.shape[0], 1).uniform_(0, 0.1)
+        soft_labels = soft_labels.cuda()
+
+        # Compute how good the generated images look by how well they were able
+        # to fool the discriminator.
+        g_loss = self.loss(d_output, soft_labels)
         g_loss.cuda()
 
+        # Step optimizer
         g_loss.backward()
         self.g_opt.step()
 
-        return fake_images[:1], fake_labels[:1], g_loss.data.item()
+        return generated_images[:1], labels[:1], g_loss.data.item()
 
 
     def train(self):
         t1 = tqdm(range(self.epochs), position=0)
+
+        # For each epoch
         for epoch in t1:
+
+            # For each batch
             for batch_index, (x, y) in tqdm(enumerate(self.train_loader), position=1, total=len(self.train_loader)):
                 d_loss = self.train_d(x, y)
-                fake_images, fake_labels, g_loss = self.train_g(x)
-            self.log_images(fake_images, fake_labels, epoch)
+
+                # Get generated images and their corresponding labels
+                generated_images, labels, g_loss = self.train_g(x)
+
+            # Save some example images
+            self.log_images(generated_images, labels, epoch)
+
+            # Update progress bar
             t1.set_description(f'D: {d_loss:.2f} | G: {g_loss:.2f}')
+
+        # Just a little prompt as a demo
         while True:
             digit = input('Enter a number between 0 and 9: ')
             digit = torch.FloatTensor([[int(digit), 5]])
