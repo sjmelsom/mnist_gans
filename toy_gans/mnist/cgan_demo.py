@@ -53,3 +53,6 @@ if input_num != '':
     # Write image to interface
     st.image(image, clamp=True)
 
+    # Draw balloons
+    st.balloons()
+
