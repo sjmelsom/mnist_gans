@@ -1,2 +1,5 @@
 runs/
 experiments/
+__pycache__/
+.vscode/
+*.pt

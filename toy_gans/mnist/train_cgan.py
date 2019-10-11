@@ -56,13 +56,16 @@ class G(nn.Module):
         return x.view(x.size(0), 28, 28)
 
 
-class MNISTGAN:
-    def __init__(self, experiment):
+class MNISTCGAN:
+    def __init__(self, data_root, debug, cuda_enabled, quiet):
         # Hyperparams
-        self.batch_size = 256
-        self.epochs = 100
+        self.batch_size = 128
+        self.epochs = 150
         self.z_dim = 100
         self.lr = 1e-4
+
+        self.cuda_enabled = cuda_enabled
+        self.quiet = quiet
 
         # Data augmentations
         transform = transforms.Compose([
@@ -71,38 +74,39 @@ class MNISTGAN:
         ])
 
         # Instantiate data loader
-        self.train_dataset = datasets.MNIST(root='/data', train=True, download=True, transform=transform)
+        self.train_dataset = datasets.MNIST(root=data_root, train=True, download=True, transform=transform)
         self.train_loader = torch.utils.data.DataLoader(dataset=self.train_dataset, batch_size=self.batch_size, shuffle=True)
 
         num_digits = 10
-        self.mnist_dim = self.train_dataset.train_data.size(1) * self.train_dataset.train_data.size(2)
+        self.mnist_dim = self.train_dataset.data.size(1) * self.train_dataset.data.size(2)
 
         # Setup discriminator
         self.d = D(self.mnist_dim+num_digits, 1)
-        self.d.cuda()
+        if self.cuda_enabled:
+            self.d.cuda()
 
         # Setup generator
         self.g = G(self.z_dim+num_digits, self.mnist_dim)
-        self.g.cuda()
+        if self.cuda_enabled:
+            self.g.cuda()
 
         # Setup loss and optimizers
         self.loss = nn.BCELoss()
         self.g_opt = optim.Adam(self.g.parameters(), lr=self.lr)
         self.d_opt = optim.Adam(self.d.parameters(), lr=self.lr)
 
-        # Setup logging
-        self.writer = SummaryWriter()
-        self.experiment = experiment
-        exp_dir = os.path.join('experiments', 'cgan', experiment)
-        self.images_dir = os.path.join(exp_dir, 'images')
-        if not os.path.exists(self.images_dir):
-            os.makedirs(self.images_dir)
+        # Setup options
+        if debug:
+            self.epochs = 1
 
     def train_d(self, x, labels):
         self.d.zero_grad()
 
-        x = x.cuda()
-        labels = labels.long().cuda()
+        labels = labels.long()
+
+        if self.cuda_enabled:
+            x = x.cuda()
+            labels = labels.cuda()
 
         # Pass real examples through discriminator
         d_output = self.d(x, labels)
@@ -114,11 +118,13 @@ class MNISTGAN:
         
         # Create latent noise vectors
         z = torch.FloatTensor(self.batch_size, self.z_dim).normal_()
-        z = z.cuda()
+        if self.cuda_enabled:
+            z = z.cuda()
 
         # Create labels
-        labels = torch.FloatTensor(self.batch_size, 1).random_(0, 10)
-        labels = labels.long().cuda()
+        labels = torch.LongTensor(self.batch_size, 1).random_(0, 10)
+        if self.cuda_enabled:
+            labels = labels.cuda()
 
         # Generate images
         generated_images = self.g(z, labels)
@@ -128,7 +134,8 @@ class MNISTGAN:
 
         # Create labels for generated examples
         soft_labels = torch.FloatTensor(self.batch_size, 1).uniform_(0.9, 1)
-        soft_labels = soft_labels.cuda()
+        if self.cuda_enabled:
+            soft_labels = soft_labels.cuda()
 
         # Compute loss for generated examples
         generated_loss = self.loss(d_output, soft_labels)
@@ -144,12 +151,14 @@ class MNISTGAN:
         self.g.zero_grad()
 
         # Create random labels
-        labels = torch.FloatTensor(self.batch_size, 1).random_(0, 10)
-        labels = labels.long().cuda()
+        labels = torch.LongTensor(self.batch_size, 1).random_(0, 10)
+        if self.cuda_enabled:
+            labels = labels.cuda()
 
         # Create latent noise vectors
         z = torch.FloatTensor(labels.shape[0], self.z_dim).normal_()
-        z = z.cuda()
+        if self.cuda_enabled:
+            z = z.cuda()
 
         # Pass noise and labels through generator to create generated images
         generated_images = self.g(z, labels)
@@ -159,74 +168,89 @@ class MNISTGAN:
 
         # Create soft labels (near 0 or 1 instead of exactly 0 or 1)
         soft_labels = torch.FloatTensor(labels.shape[0], 1).uniform_(0, 0.1)
-        # soft_labels = torch.FloatTensor(labels.shape[0], 1).uniform_(0.9, 1)
-        soft_labels = soft_labels.cuda()
+        if self.cuda_enabled:
+            soft_labels = soft_labels.cuda()
 
         # Compute how good the generated images look by how well they were able
         # to fool the discriminator.
         g_loss = self.loss(d_output, soft_labels)
-        g_loss.cuda()
+        if self.cuda_enabled:
+            g_loss.cuda()
 
         # Step optimizer
         g_loss.backward()
         self.g_opt.step()
 
-        return generated_images[:10], labels[:10], g_loss.data.item()
-
+        return g_loss.data.item()
 
     def train(self):
-        t1 = tqdm(range(self.epochs), position=0)
+        writer = SummaryWriter()
 
-        # For each epoch
-        for epoch in t1:
-
-            # For each batch
-            for batch_index, (x, y) in tqdm(enumerate(self.train_loader), position=1, total=len(self.train_loader)):
+        for epoch in range(self.epochs):
+            tbar = tqdm(
+                enumerate(self.train_loader), 
+                total=len(self.train_loader), 
+                desc=f'Epoch: {epoch+1}/{self.epochs}', 
+                disable=self.quiet
+            )
+            for batch_index, (x, y) in tbar:
                 d_loss = self.train_d(x, y)
 
                 # Get generated images and their corresponding labels
-                generated_images, labels, g_loss = self.train_g(x)
+                g_loss = self.train_g(x)
 
-            self.writer.add_scalar('Generator Loss', g_loss, epoch)
-            self.writer.add_scalar('Discriminator Loss', d_loss, epoch)
-            imgs = make_grid(generated_images, normalize=True, scale_each=True)
-            self.writer.add_image('Generated Images', imgs, epoch)
+            # Record layer metrics in tensorboard
+            sd = self.g.state_dict()
+            for l in sd.keys():
+                writer.add_histogram(l, sd[l].cpu().detach().numpy(), epoch)
+
+            # Keep track of metrics
+            writer.add_scalar('D Loss', d_loss, epoch)
+            writer.add_scalar('G Loss', g_loss, epoch)
+
+            # Keep track of learning rate
+            g_opt_lr = self.g_opt.state_dict()['param_groups'][0]['lr']
+            writer.add_scalar('Generator Learning Rate', g_opt_lr, epoch)
 
             # Save some example images
-            # self.log_images(generated_images, labels, epoch)
+            image_grid = self.generate_examples()
+            writer.add_image('Image', image_grid, epoch)
 
-            # Update progress bar
-            t1.set_description(f'D: {d_loss:.2f} | G: {g_loss:.2f}')
+        # Close writer
+        writer.close()
 
-        self.writer.close()
-
-        # Just a little prompt as a demo
-        while True:
-            digit = input('Enter a number between 0 and 9: ')
-            digit = torch.FloatTensor([[int(digit), 5]])
-            digit = digit.long().cuda()
-            z = torch.FloatTensor(2, self.z_dim).normal_()
+    def generate_examples(self):
+        # Create latent noise vectors
+        z = torch.FloatTensor(50, self.z_dim).normal_()
+        if self.cuda_enabled:
             z = z.cuda()
-            generated_image = self.g(z, digit)[0].cpu().detach().numpy()
-            generated_image = rescale_intensity(generated_image, out_range=(0, 255)).astype(np.uint16)
-            plt.imshow(generated_image)
-            plt.show()
 
+        # Create labels
+        labels = torch.LongTensor(np.repeat(np.arange(0, 10), 5).reshape(10, 5).T.flatten())
+        if self.cuda_enabled:
+            labels = labels.cuda()
+        images = self.g(z, labels)
 
-    def log_images(self, imgs, labels, epoch):
-        labels = [label.cpu().detach().numpy() for label in labels]
-        label = labels[0][0]
-        im_name = os.path.join(self.images_dir, f'epoch{epoch}_digit{label}.png')
-        imgs = [img.cpu().detach().numpy() for img in imgs]
-        imgs = [rescale_intensity(img, out_range=(0, 255)).astype(np.uint8) for img in imgs]
-        imgs = np.hstack(imgs)
-        imsave(im_name, imgs)
-
+        images = images.view(-1, 1, 28, 28)
+        return make_grid(images, nrow=10)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--experiment')
+    parser.add_argument('--savegen', dest='save_model', action='store_true')
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--dataroot', dest='data_root', default='../data')
+    parser.add_argument('--quiet', action='store_true')
     args = parser.parse_args()
-    gan = MNISTGAN(args.experiment)
+
+    # Check for cuda
+    cuda_enabled = torch.cuda.is_available()
+
+    # Instantiate model
+    gan = MNISTCGAN(args.data_root, args.debug, cuda_enabled, args.quiet)
+
+    # Train model
     gan.train()
 
+    # Save model
+    if args.save_model:
+        torch.save(gan.g.state_dict(), 'mnist_cgen.pt')
