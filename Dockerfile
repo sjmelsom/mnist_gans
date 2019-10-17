@@ -1,6 +1,9 @@
-FROM pytorch:19.09
+FROM pytorch:19.09-py3
 
-COPY toy_gans /
+COPY toy_gans /opt/
 
-RUN pip install -r requirements.txt
+# RUN cd /opt/toy_gans
 
+# RUN pip install -r requirements.txt
+
+ENTRYPOINT ["bash"]
