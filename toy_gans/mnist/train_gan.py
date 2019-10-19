@@ -6,8 +6,6 @@ import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
 from torch import optim
-from skimage.io import imsave
-import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from torchvision import datasets
 from torchvision import transforms

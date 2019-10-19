@@ -1,14 +1,16 @@
 import os
-import torch
 import argparse
+
+import torch
 import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
 from torch import optim
-from skimage.io import imsave
 import torch.nn.functional as F
 from torchvision import datasets
 from torchvision import transforms
+from tensorboardX import SummaryWriter
+from torchvision.utils import make_grid
 from skimage.exposure import rescale_intensity
 
 
@@ -48,12 +50,18 @@ class G(nn.Module):
 
 
 class CIFAR10GAN:
-    def __init__(self, experiment):
+    def __init__(self, data_root, debug, cuda_enabled, quiet, checkpoint):
         # Hyperparams
         self.batch_size = 128
         self.epochs = 200
         self.z_dim = 100
         self.lr = 2e-4
+
+        self.cuda_enabled = cuda_enabled
+        self.quiet = quiet
+        self.checkpoint_dir = 'checkpoints'
+        if not os.path.isdir(self.checkpoint_dir):
+            os.mkdir(self.checkpoint_dir)
 
         # Data augmentations
         transform = transforms.Compose([
@@ -62,36 +70,45 @@ class CIFAR10GAN:
         ])
 
         # Instantiate data loaders
-        self.train_dataset = datasets.CIFAR10(root='../data', train=True, download=True, transform=transform)
+        self.train_dataset = datasets.CIFAR10(root=data_root, train=True, download=True, transform=transform)
         self.train_loader = torch.utils.data.DataLoader(dataset=self.train_dataset, batch_size=self.batch_size, shuffle=True)
         self.num_channels = 1 if self.train_dataset.data.ndim == 3 else self.train_dataset.data.shape[3]
 
         # Setup discriminator
         self.d = D(self.num_channels)
-        self.d.cuda()
+        if self.cuda_enabled:
+            self.d.cuda()
 
         # Setup generator
         self.g = G(self.z_dim, self.num_channels)
-        self.g.cuda()
+        if self.cuda_enabled:
+            self.g.cuda()
+
+        # Load checkpoint
+        if checkpoint is not None:
+            state_dict = torch.load(checkpoint)
+            self.g.load_state_dict(state_dict['g'])
+            self.d.load_state_dict(state_dict['d'])
 
         # Setup loss and optimizers
         self.loss = nn.BCELoss()
         self.g_opt = optim.Adam(self.g.parameters(), lr=self.lr)
         self.d_opt = optim.Adam(self.d.parameters(), lr=self.lr)
 
-        # Setup logging
-        self.experiment = experiment
-        exp_dir = os.path.join('experiments', 'gan', experiment)
-        self.images_dir = os.path.join(exp_dir, 'images')
-        if not os.path.exists(self.images_dir):
-            os.makedirs(self.images_dir)
+        # Setup options
+        if debug:
+            self.epochs = 1
 
     def train_d(self, x):
         self.d.zero_grad()
 
-        x_real = x.cuda()
+        if self.cuda_enabled:
+            x_real = x.cuda()
+
+        # Create soft labels for real examples
         soft_labels = torch.FloatTensor(x.shape[0], 1).uniform_(0, 0.1).squeeze()
-        soft_labels = soft_labels.cuda()
+        if self.cuda_enabled:
+            soft_labels = soft_labels.cuda()
 
         # Pass real examples through discriminator
         d_output = self.d(x_real)
@@ -101,15 +118,18 @@ class CIFAR10GAN:
         
         # Create latent noise vectors
         z = torch.FloatTensor(self.batch_size, self.z_dim, 1, 1).normal_()
-        z = z.cuda()
+        if self.cuda_enabled:
+            z = z.cuda()
 
         # Generate generated examples
         generated_images = self.g(z)
-        generated_images = generated_images.cuda()
+        if self.cuda_enabled:
+            generated_images = generated_images.cuda()
 
         # Create labels for generated examples
         soft_labels = torch.FloatTensor(self.batch_size, 1).uniform_(0.9, 1).squeeze()
-        soft_labels = soft_labels.cuda()
+        if self.cuda_enabled:
+            soft_labels = soft_labels.cuda()
 
         # Pass generated examples through discriminator
         generated_images = self.d(generated_images)
@@ -127,11 +147,13 @@ class CIFAR10GAN:
 
         # Create labels
         soft_labels = torch.FloatTensor(self.batch_size, 1).uniform_(0, 0.1).squeeze()
-        soft_labels = soft_labels.cuda()
+        if self.cuda_enabled:
+            soft_labels = soft_labels.cuda()
 
         # Create latent noise vectors
         z = torch.FloatTensor(self.batch_size, self.z_dim, 1, 1).normal_()
-        z = z.cuda()
+        if self.cuda_enabled:
+            z = z.cuda()
 
         # Pass noise through generator to create generated images
         generated_images = self.g(z)
@@ -149,40 +171,82 @@ class CIFAR10GAN:
 
         return generated_images[:10], g_loss.data.item()
 
+    def save_checkpoint(self, epoch):
+        state_dict = {
+            'g': self.g.state_dict(),
+            'd': self.d.state_dict()
+        }
+        torch.save(state_dict, os.path.join(self.checkpoint_dir, f'{epoch}_cifar10gan.pt'))
 
     def train(self):
-        t1 = tqdm(range(self.epochs), position=0)
+        writer = SummaryWriter()
+        g_opt_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.g_opt, 0.99999)
 
         # For each epoch
-        for epoch in t1:
-
+        for epoch in range(self.epochs):
+            tbar = tqdm(
+                enumerate(self.train_loader), 
+                total=len(self.train_loader), 
+                desc=f'Epoch: {epoch+1}/{self.epochs}', 
+                disable=self.quiet
+            )
             # For each batch
-            for batch_index, (x, _) in tqdm(enumerate(self.train_loader), position=1, total=len(self.train_loader)):
+            for batch_index, (x, _) in tbar:
                 d_loss = self.train_d(x)
 
                 # Get generated images and their corresponding labels
                 generated_images, g_loss = self.train_g(x)
 
+                # Step schedulers
+                g_opt_scheduler.step()
+
+            # Record layer metrics in tensorboard
+            sd = self.g.state_dict()
+            for l in sd.keys():
+                writer.add_histogram(l, sd[l].cpu().detach().numpy(), epoch)
+
+            if epoch % 10 == 0:
+                self.save_checkpoint(epoch)
+
+            # Keep track of metrics
+            writer.add_scalar('D Loss', d_loss, epoch)
+            writer.add_scalar('G Loss', g_loss, epoch)
+
+            # Keep track of learning rate
+            g_opt_lr = self.g_opt.state_dict()['param_groups'][0]['lr']
+            writer.add_scalar('Generator Learning Rate', g_opt_lr, epoch)
+
             # Save some example images
-            self.log_images(generated_images, epoch)
+            image_grid = self.setup_images_for_tboard(generated_images)
+            writer.add_image('Image', image_grid, epoch)
             
-            # Update progress bar
-            t1.set_description(f'D: {d_loss:.2f} | G: {g_loss:.2f}')
+        # Close writer
+        writer.close()
 
-
-    def log_images(self, generated_images, epoch):
-        im_name = os.path.join(self.images_dir, f'epoch{epoch}.jpg')
-        # imgs = generated_images.view(-1, 3, 32, 32)
-        imgs = [img.cpu().detach().numpy() for img in generated_images]
-        imgs = [rescale_intensity(img, out_range=(0, 255)).astype(np.uint8) for img in imgs]
-        imgs = np.hstack(np.moveaxis(np.array(imgs), 1, 3))
-        imsave(im_name, imgs)
-
+    def setup_images_for_tboard(self, generated_images):
+        imgs = generated_images.view(-1, 3, 32, 32)
+        grid = make_grid(imgs, nrow=5)
+        return grid
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--experiment')
+    parser.add_argument('--savegen', dest='save_model', action='store_true')
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--dataroot', dest='data_root', default='../data')
+    parser.add_argument('--quiet', action='store_true')
+    parser.add_argument('--warmstart', dest='checkpoint')
     args = parser.parse_args()
-    gan = CIFAR10GAN(args.experiment)
+
+    # Check for cuda
+    cuda_enabled = torch.cuda.is_available()
+
+    # Instantiate model
+    gan = CIFAR10GAN(args.data_root, args.debug, cuda_enabled, args.quiet, args.checkpoint)
+
+    # Train model
     gan.train()
+
+    # Save model
+    if args.save_model:
+        torch.save(gan.g.state_dict(), 'cifar10_gen.pt')
 
