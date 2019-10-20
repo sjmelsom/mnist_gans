@@ -53,7 +53,7 @@ class CIFAR10GAN:
     def __init__(self, data_root, debug, cuda_enabled, quiet, checkpoint):
         # Hyperparams
         self.batch_size = 128
-        self.epochs = 200
+        self.epochs = 300
         self.z_dim = 100
         self.lr = 2e-4
 
@@ -85,10 +85,12 @@ class CIFAR10GAN:
             self.g.cuda()
 
         # Load checkpoint
+        self.cur_epoch = 0
         if checkpoint is not None:
             state_dict = torch.load(checkpoint)
             self.g.load_state_dict(state_dict['g'])
             self.d.load_state_dict(state_dict['d'])
+            self.cur_epoch = int(os.path.basename(checkpoint).split('_')[0])
 
         # Setup loss and optimizers
         self.loss = nn.BCELoss()
@@ -180,10 +182,10 @@ class CIFAR10GAN:
 
     def train(self):
         writer = SummaryWriter()
-        g_opt_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.g_opt, 0.99999)
+        # g_opt_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.g_opt, 0.99999)
 
         # For each epoch
-        for epoch in range(self.epochs):
+        for epoch in range(self.cur_epoch, self.epochs):
             tbar = tqdm(
                 enumerate(self.train_loader), 
                 total=len(self.train_loader), 
@@ -198,7 +200,7 @@ class CIFAR10GAN:
                 generated_images, g_loss = self.train_g(x)
 
                 # Step schedulers
-                g_opt_scheduler.step()
+                # g_opt_scheduler.step()
 
             # Record layer metrics in tensorboard
             sd = self.g.state_dict()
