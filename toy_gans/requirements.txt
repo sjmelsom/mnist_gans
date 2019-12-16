@@ -54,7 +54,7 @@ six==1.12.0
 streamlit==0.47.4
 tensorboard==1.14.0
 tensorboardX==1.9
-tensorflow==1.14.0
+tensorflow==1.15.0
 tensorflow-estimator==1.14.0
 termcolor==1.1.0
 toml==0.10.0
