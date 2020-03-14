@@ -20,42 +20,50 @@ class D(nn.Module):
         self.conv1 = nn.Conv2d(in_channels, 64, 4, 2, 1, bias=False)
         self.conv2 = nn.Conv2d(self.conv1.out_channels, 64*2, 4, 2, 1, bias=False)
         self.conv3 = nn.Conv2d(self.conv2.out_channels, 64*4, 4, 2, 1, bias=False)
-        self.conv4 = nn.Conv2d(self.conv3.out_channels, 1, 4, 2, 0, bias=False)
+        self.conv4 = nn.Conv2d(self.conv3.out_channels, 64*8, 4, 2, 1, bias=False)
+        self.conv5 = nn.Conv2d(self.conv4.out_channels, 1, 4, 1, 0, bias=False)
         self.bn1 = nn.BatchNorm2d(64*2)
         self.bn2 = nn.BatchNorm2d(64*4)
+        self.bn3 = nn.BatchNorm2d(64*8)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.bn1(self.conv2(x)))
-        x = F.relu(self.bn2(self.conv3(x)))
-        x = F.relu(self.conv4(x))
+        x = F.leaky_relu(self.conv1(x))
+        x = F.leaky_relu(self.bn1(self.conv2(x)))
+        x = F.leaky_relu(self.bn2(self.conv3(x)))
+        x = F.leaky_relu(self.bn3(self.conv4(x)))
+        x = F.leaky_relu(self.conv5(x))
         return torch.sigmoid(x).squeeze()
 
 class G(nn.Module):
     def __init__(self, input_size, output_channels):
         super(G, self).__init__()
-        self.conv1 = nn.ConvTranspose2d(input_size, 64*4, 4, 1, 0, bias=False)
-        self.conv2 = nn.ConvTranspose2d(self.conv1.out_channels, 64*2, 4, 2, 1, bias=False)
-        self.conv3 = nn.ConvTranspose2d(self.conv2.out_channels, 64, 4, 2, 1, bias=False)
-        self.conv4 = nn.ConvTranspose2d(self.conv3.out_channels, 3, 4, 2, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64*4)
-        self.bn2 = nn.BatchNorm2d(64*2)
-        self.bn3 = nn.BatchNorm2d(64)
+        self.conv1 = nn.ConvTranspose2d(input_size, 64*8, 4, 1, 0, bias=False)
+        self.conv2 = nn.ConvTranspose2d(self.conv1.out_channels, 64*4, 4, 2, 1, bias=False)
+        self.conv3 = nn.ConvTranspose2d(self.conv2.out_channels, 64*2, 4, 2, 1, bias=False)
+        self.conv4 = nn.ConvTranspose2d(self.conv3.out_channels, 64, 4, 2, 1, bias=False)
+        self.conv5 = nn.ConvTranspose2d(self.conv4.out_channels, 3, 4, 2, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64*8)
+        self.bn2 = nn.BatchNorm2d(64*4)
+        self.bn3 = nn.BatchNorm2d(64*2)
+        self.bn4 = nn.BatchNorm2d(64)
 
     def forward(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
-        return torch.tanh(self.conv4(x))
+        x = F.relu(self.bn4(self.conv4(x)))
+        return torch.tanh(self.conv5(x))
 
 
-class CIFAR10GAN:
+class DCGAN:
     def __init__(self, data_root, debug, cuda_enabled, quiet, checkpoint):
         # Hyperparams
-        self.batch_size = 128
-        self.epochs = 300
+        self.batch_size = 64
+        self.epochs = 100
         self.z_dim = 100
-        self.lr = 2e-4
+        self.lr = 0.0002
+
+        self.image_size = 64
 
         self.cuda_enabled = cuda_enabled
         self.quiet = quiet
@@ -65,14 +73,15 @@ class CIFAR10GAN:
 
         # Data augmentations
         transform = transforms.Compose([
+            transforms.Resize((self.image_size, self.image_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=(0.5,), std=(0.5,))
+            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
         ])
 
         # Instantiate data loaders
-        self.train_dataset = datasets.CIFAR10(root=data_root, train=True, download=True, transform=transform)
+        self.train_dataset = datasets.CelebA(root=data_root, split='all', download=True, transform=transform)
         self.train_loader = torch.utils.data.DataLoader(dataset=self.train_dataset, batch_size=self.batch_size, shuffle=True)
-        self.num_channels = 1 if self.train_dataset.data.ndim == 3 else self.train_dataset.data.shape[3]
+        self.num_channels = 3
 
         # Setup discriminator
         self.d = D(self.num_channels)
@@ -94,8 +103,8 @@ class CIFAR10GAN:
 
         # Setup loss and optimizers
         self.loss = nn.BCELoss()
-        self.g_opt = optim.Adam(self.g.parameters(), lr=self.lr)
-        self.d_opt = optim.Adam(self.d.parameters(), lr=self.lr)
+        self.g_opt = optim.Adam(self.g.parameters(), lr=self.lr, betas=(0.5, 0.999))
+        self.d_opt = optim.Adam(self.d.parameters(), lr=self.lr, betas=(0.5, 0.999))
 
         # Setup options
         if debug:
@@ -232,7 +241,6 @@ class CIFAR10GAN:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--savegen', dest='save_model', action='store_true')
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--dataroot', dest='data_root', default='../data')
     parser.add_argument('--quiet', action='store_true')
@@ -243,12 +251,8 @@ if __name__ == '__main__':
     cuda_enabled = torch.cuda.is_available()
 
     # Instantiate model
-    gan = CIFAR10GAN(args.data_root, args.debug, cuda_enabled, args.quiet, args.checkpoint)
+    gan = DCGAN(args.data_root, args.debug, cuda_enabled, args.quiet, args.checkpoint)
 
     # Train model
     gan.train()
-
-    # Save model
-    if args.save_model:
-        torch.save(gan.g.state_dict(), 'cifar10_gen.pt')
 
